@@ -44,9 +44,9 @@ See [Important console variables](#important-console-variables).
 
 | | |
 |---|---|
-| **OS** | Windows 10 or 11, 64-bit |
+| **OS** | Windows 10 or 11, 64-bit, or 64-bit Linux (see [Linux](#linux)) |
 | **CPU** | **Must support AVX2** — Intel 4th-gen Core (2013) or newer, AMD Zen (2017) or newer. |
-| **GPU** | Direct3D 12 capable |
+| **GPU** | Direct3D 12 capable (Windows), Vulkan capable (Linux) |
 | **Game data** | Your own legally obtained copy of Ace Combat 6 (US region only! Europe and Japan is not supported) |
 
 *Note that the system requirement does not guarantees that the recomp will perform well on your system!*
@@ -93,6 +93,7 @@ Settings live in **`ac6recomp.toml`** next to the executable. Most can also be c
 | `ac6_cursor_hide_seconds` | `3.0` | Hide the mouse cursor after this many idle seconds. `0` = never hide |
 | `ac6_kbm_enabled` | `false` | **Enable keyboard and mouse controls.** Off by default — controllers work out of the box |
 | `ac6_kbm_config` | `ac6_input.toml` | Path to the key bindings file. Edits are picked up live |
+| `ac6_keyboard_glyphs` | `false` | Replace six shared Xbox button icons with fixed mouse/key prompts on either renderer. Restart required; see [glyph details](docs/KEYBOARD_GLYPHS.txt) |
 | `ac6_texture_swaps_enabled` | `false` | Enable texture replacement mods (see [Modding docs](#modding-docs)) |
 
 For 1440p, set both `draw_resolution_scale_x` and `draw_resolution_scale_y` to `2`. For 2160p or 4K, set them to `3`.
@@ -129,7 +130,7 @@ Bindings live in `ac6_input.toml`, created next to the executable on first run a
 | Pitch down / up | `1` / `3` | | Fire machine gun | `Mouse1`, `Left Ctrl` |
 | Roll left / right | `A` / `D` | | Fire missile | `Mouse2`, `Space` |
 | Yaw left / right | `Q` / `E` | | Change weapon | `Mouse wheel`, `C` |
-| Accelerate | `W` | | Switch targets | `Tab` |
+| Accelerate | `W` | | Switch targets | `Tab`, `T` |
 | Decelerate | `S` | | Change view | `V` |
 | High-G turn | `2` | | Radar / map | `R` |
 | Autopilot | `Z`, `X` | | Landing gear | `G` |
@@ -150,6 +151,18 @@ Bindings live in `ac6_input.toml`, created next to the executable on first run a
 | Cancel | `Escape`, `Backspace`, `Mouse2` |
 | Start | `Enter` |
 | Back | `Tab` |
+| Auxiliary X / Y actions | `R` / `T` |
+| Previous / next page (LB / RB) | `Q` / `E` |
+
+Set `ac6_keyboard_glyphs = true` and restart for fixed prompt artwork: A/B
+become left/right mouse icons, and X/Y/LB/RB become R/T/Q/E keycaps. These
+icons do not follow custom bindings or switch automatically with controllers.
+Linux mouse/keyboard controls use XInput2 through X11/Xwayland. Enable
+`ac6_kbm_enabled` for mouse steering, buttons/wheel, and keyboard bindings.
+For an existing bindings file, add `T` to `[flight].switch_targets` so that
+the fixed Y prompt also matches target switching in flight.
+
+![Fixed default mouse and keyboard prompt artwork](docs/keyboard_glyphs_preview.png)
 
 ---
 
@@ -181,6 +194,32 @@ cmake --build --preset win-amd64-relwithdebinfo
 The executable is placed at `out/build/win-amd64-relwithdebinfo/ac6recomp.exe`.
 
 On Windows, use the preset commands above rather than plain `cmake -L` in the repo root. If you previously configured from an `x86` Visual Studio prompt or with the wrong compiler on `PATH`, delete `out/build/win-amd64-relwithdebinfo` and re-run the preset from a normal 64-bit PowerShell/CMD window or an x64 Native Tools prompt.
+
+### Linux
+
+The Linux build uses the Vulkan renderer. You need Clang 18 or newer, CMake 3.25+, Ninja, pkg-config, the GTK 3 and X11-XCB development files, and a Vulkan driver. Install the PipeWire, PulseAudio or ALSA development files too: the bundled SDL picks its audio backends when you configure, and builds without sound if it finds none.
+
+| Distribution | Build dependencies |
+|---|---|
+| Arch, CachyOS | `sudo pacman -S --needed clang cmake ninja pkgconf gtk3 libx11 libxi alsa-lib libpulse pipewire` |
+| Ubuntu 24.04+ | `sudo apt install clang cmake ninja-build pkg-config libgtk-3-dev libx11-xcb-dev libxi-dev libasound2-dev libpulse-dev libpipewire-0.3-dev libudev-dev` |
+| Fedora | `sudo dnf install clang cmake ninja-build pkgconf-pkg-config gtk3-devel libX11-devel libXi-devel alsa-lib-devel pulseaudio-libs-devel pipewire-devel systemd-devel` |
+
+**Build.** Point the script at your extracted game folder (the one holding `default.xex`), or put the `.iso` in the repository root and install [extract-xiso](https://github.com/XboxDev/extract-xiso):
+
+```bash
+./setup_and_build.sh /path/to/extracted/game
+```
+
+The manual equivalent is the four commands from Option B with the `linux-amd64-relwithdebinfo` preset.
+
+**Run.** Start `out/build/linux-amd64-relwithdebinfo/ac6recomp`. The script links your game files in as `assets/` next to the executable; alternatively pass the game folder as the first argument. Raw DLC packages go in a `dlc/` folder next to the executable, or pass `--dlc_dir=/path/to/dlc`. Any setting can be given on the command line the same way (`--name=value`).
+
+- Saves live in `~/.local/share/ac6recomp`. The pipeline cache is written to `cache/` in the working directory, so start the game from the same folder each time.
+- On Wayland the window opens through XWayland automatically.
+- On laptops with two GPUs, if the wrong one is picked, choose it with `--vulkan_device=N`, where `N` is its position in `vulkaninfo --summary` (counting from 0).
+- Mouse/keyboard controls use X11/Xwayland and require XInput 2.1 or later; see [input details](docs/LINUX_INPUT.txt).
+- Texture replacement mods are not yet available on Linux; built-in keyboard glyphs work on either renderer.
 
 ---
 

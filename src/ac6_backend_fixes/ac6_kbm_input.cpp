@@ -56,6 +56,8 @@
 #include <rex/ui/imgui_drawer.h>
 #include <rex/ui/keybinds.h>
 #include <rex/ui/virtual_key.h>
+#include "../ac6_linux_input.h"
+#include "ac6_mouse_aim.h"
 
 #if defined(_WIN32)
 #ifndef WIN32_LEAN_AND_MEAN
@@ -69,6 +71,10 @@
 
 REXCVAR_DEFINE_BOOL(ac6_kbm_enabled, false, "AC6/Enhancements",
                     "Enable keyboard and mouse controls.");
+REXCVAR_DEFINE_BOOL(ac6_keyboard_glyphs, false, "AC6/Enhancements",
+                    "Replace known Xbox button icons with fixed default mouse "
+                    "and keyboard prompts. Requires a restart; does not follow "
+                    "custom bindings or switch back when using a controller.");
 REXCVAR_DEFINE_BOOL(ac6_kbm_log, false, "AC6/Enhancements",
                     "Log keyboard and mouse input diagnostics.")
     .debug_only();
@@ -129,10 +135,18 @@ constexpr uint32_t kOffAnalogC = 0xF58;       // 32 floats
 struct ActionDef {
   const char* name;
   int mirror_bit;
+  uint16_t xinput_buttons;
 };
 constexpr ActionDef kMenuActions[] = {
-    {"up", 0},      {"down", 1},   {"left", 2},  {"right", 3},
-    {"confirm", 5}, {"cancel", 7}, {"start", 10}, {"back", 11},
+    {"up", 0, 0x0001},      {"down", 1, 0x0002},
+    {"left", 2, 0x0004},    {"right", 3, 0x0008},
+    {"confirm", 5, 0x1000}, {"cancel", 7, 0x2000},
+    {"start", 10, 0x0010},  {"back", 11, 0x0020},
+    // Auxiliary prompts previously had no menu bindings. Inject at the
+    // device layer and let the engine derive their mirror/action bits; only
+    // the original eight mirror identities have been independently verified.
+    {"x", -1, 0x4000}, {"y", -1, 0x8000},
+    {"page_left", -1, 0x0100}, {"page_right", -1, 0x0200},
 };
 constexpr size_t kNumMenuActions = std::size(kMenuActions);
 
@@ -353,7 +367,7 @@ void SetDefaultBindings(Config& c) {
   setf("high_g", {"2"});  // AC7's "Accelerate + Decelerate" key (W+S also works)
   setf("change_view", {"V"});
   setf("switch_radar_map", {"R"});
-  setf("switch_targets", {"Tab"});
+  setf("switch_targets", {"Tab", "T"});  // T also matches the fixed Y prompt
   setf("pause", {"Escape"});
   setf("wingman_up", {"Up"});
   setf("wingman_down", {"Down"});
@@ -369,6 +383,10 @@ void SetDefaultBindings(Config& c) {
   set("cancel", {"Escape", "Backspace", "Mouse2"});  // RMB = back out
   set("start", {"Enter"});
   set("back", {"Tab"});
+  set("x", {"R"});
+  set("y", {"T"});
+  set("page_left", {"Q"});
+  set("page_right", {"E"});
 }
 
 // Written next to the exe on first run when no config exists. KEEP IN SYNC
@@ -383,6 +401,11 @@ mode = "steer"
 # self-centers the moment the mouse stops (AC7/ACAH feel).
 # steer_model "position": mouse displacement sets and HOLDS the stick;
 # recenter (full deflections/second, 0 = never) eases it back to center.
+# steer_model "vector": virtual joystick - the mouse moves an on-screen
+# pointer, its offset from the centre is the stick, and it stays where you
+# leave it (Elite Dangerous / AC7 style).
+# steer_model "aim": point and fly - the mouse moves a reticle and the
+# aircraft steers itself onto it (War Thunder style).
 steer_model = "velocity"
 sensitivity_x = 1.5
 sensitivity_y = 1.5
@@ -404,6 +427,10 @@ confirm = ["Space", "Mouse1"]
 cancel  = ["Escape", "Backspace", "Mouse2"]
 start   = ["Enter"]
 back    = ["Tab"]
+x       = ["R"]
+y       = ["T"]
+page_left  = ["Q"]
+page_right = ["E"]
 
 [flight]
 pitch_down    = ["1"]
@@ -426,7 +453,7 @@ autopilot     = ["Z", "X"]
 high_g        = ["2"]
 change_view   = ["V"]
 switch_radar_map = ["R"]
-switch_targets   = ["Tab"]
+switch_targets   = ["Tab", "T"]
 pause         = ["Escape"]
 wingman_up    = ["Up"]
 wingman_down  = ["Down"]
@@ -658,12 +685,18 @@ GateState QueryGate() {
   }
   NoteFocusForKeyTrust(g.fg_ok);
 #else
-  g.fg_ok = true;
+  g.fg_ok = ac6::LinuxInputFocused();
 #endif
   g.capture_mouse = rex::ui::ImGuiDrawer::DialogsCaptureMouse();
   g.capture_keyboard = rex::ui::ImGuiDrawer::DialogsCaptureKeyboard();
   g.want_text = rex::ui::ImGuiDrawer::DialogsWantTextInput();
   g.steer_owns_pointer = g_mouse.capturing;
+#if !defined(_WIN32)
+  // Release the pointer as soon as an interactive overlay owns either input
+  // kind. This lets F4 work while flying without a click through the game.
+  ac6::SetLinuxInputOverlay(g.capture_mouse || g.capture_keyboard || g.want_text);
+  g.steer_owns_pointer = ac6::LinuxMouseCaptured();
+#endif
   return g;
 }
 
@@ -688,13 +721,15 @@ bool KeyAllowed(const GateState& gate, VirtualKey vk) {
 }
 
 bool KeyHeld(VirtualKey vk) {
+#if !defined(_WIN32)
+  return ac6::LinuxKeyHeld(static_cast<unsigned>(vk));
+#else
   if (vk == kVkWheelUp) {
     return NowMs() < g_wheel_up_until.load(std::memory_order_relaxed);
   }
   if (vk == kVkWheelDown) {
     return NowMs() < g_wheel_down_until.load(std::memory_order_relaxed);
   }
-#if defined(_WIN32)
   const bool down = (GetAsyncKeyState(static_cast<int>(vk)) & 0x8000) != 0;
   std::atomic<uint8_t>& trust = g_key_trust[static_cast<int>(vk) & 0xFF];
   if (!down) {
@@ -714,9 +749,6 @@ bool KeyHeld(VirtualKey vk) {
                        g_focus_seen.load(std::memory_order_relaxed) ? "across focus gain"
                                                                     : "at startup"));
   }
-  return false;
-#else
-  (void)vk;
   return false;
 #endif
 }
@@ -862,12 +894,15 @@ void CursorIdleHideTick() {}
 // into a clamped stick position with config-driven feel. Keyboard pitch/roll
 // overrides its axis.
 void MouseSteerRelease() {
+  ac6::mouse_aim::Reset();
   g_mouse.capturing = false;
   g_mouse.x = g_mouse.y = 0.0;
   g_mouse.rate_x = g_mouse.rate_y = 0.0;
   g_mouse.cam_x = g_mouse.cam_y = 0.0;
 #if defined(_WIN32)
   SetCursorHidden(false, nullptr);
+#else
+  ac6::RequestLinuxMouseCapture(false);
 #endif
 }
 
@@ -877,12 +912,12 @@ void MouseSteerRelease() {
 // HOLDS while the mouse rests (the camera stays where you put it), and
 // resets to neutral when the key is released.
 bool MouseSteerPoll(bool cam_mode, double& out_x, double& out_y) {
-#if defined(_WIN32)
   const MouseConfig& mc = g_config.mouse;
   if (mc.mode != "steer") {
     MouseSteerRelease();
     return false;
   }
+#if defined(_WIN32)
   HWND fg = GetForegroundWindow();
   if (!fg) {
     MouseSteerRelease();
@@ -898,14 +933,26 @@ bool MouseSteerPoll(bool cam_mode, double& out_x, double& out_y) {
 
   POINT cur;
   GetCursorPos(&cur);
+  double dx_px = static_cast<double>(cur.x - center.x);
+  double dy_px = static_cast<double>(cur.y - center.y);
+#else
+  ac6::RequestLinuxMouseCapture(true);
+  double dx_px = 0, dy_px = 0;
+  if (!ac6::TakeLinuxMouseMotion(dx_px, dy_px)) {
+    // Capture happens asynchronously on the UI thread. Keep the request
+    // alive while waiting, but never reuse steering from an earlier session.
+    g_mouse.capturing = false;
+    g_mouse.x = g_mouse.y = g_mouse.rate_x = g_mouse.rate_y = 0;
+    g_mouse.cam_x = g_mouse.cam_y = 0;
+    return false;
+  }
+#endif
   const int64_t now = NowMs();
   if (g_mouse.capturing && now - g_mouse.last_ms > 250) {
     g_mouse.capturing = false;  // stale anchor (gate was closed) - re-anchor
   }
   if (g_mouse.capturing) {
     const double dt = std::max(0.001, std::min(0.1, (now - g_mouse.last_ms) / 1000.0));
-    double dx_px = static_cast<double>(cur.x - center.x);
-    double dy_px = static_cast<double>(cur.y - center.y);
     if (mc.invert_x) dx_px = -dx_px;
     if (mc.invert_y) dy_px = -dy_px;
 
@@ -920,6 +967,26 @@ bool MouseSteerPoll(bool cam_mode, double& out_x, double& out_y) {
       // Freeze the steering models while panning so releasing the camera key
       // never produces a stale steering kick.
       g_mouse.rate_x = g_mouse.rate_y = 0.0;
+    } else if (mc.steer_model == "aim") {
+      // Point-and-fly: the mouse moves a reticle and the aircraft steers
+      // itself onto it (ac6_mouse_aim.cpp).
+      if (!ac6::mouse_aim::Steer(dx_px * mc.sensitivity_x, dy_px * mc.sensitivity_y, g_mouse.x,
+                                 g_mouse.y)) {
+        g_mouse.x = g_mouse.y = 0.0;
+      }
+      g_mouse.rate_x = g_mouse.rate_y = 0.0;
+    } else if (mc.steer_model == "vector") {
+      // Virtual joystick (Elite Dangerous / AC7 style): the mouse moves an
+      // on-screen pointer whose offset from the centre is the stick, held
+      // where it is left. Round range; never recentres.
+      g_mouse.x += dx_px * mc.sensitivity_x / 500.0;
+      g_mouse.y += dy_px * mc.sensitivity_y / 500.0;  // positive = pull
+      const double len = std::hypot(g_mouse.x, g_mouse.y);
+      if (len > 1.0) {
+        g_mouse.x /= len;
+        g_mouse.y /= len;
+      }
+      ac6::mouse_aim::ShowStick(g_mouse.x, g_mouse.y);
     } else if (mc.steer_model == "position") {
       const double dx = dx_px * mc.sensitivity_x / 500.0;
       const double dy = dy_px * mc.sensitivity_y / 500.0;
@@ -966,8 +1033,10 @@ bool MouseSteerPoll(bool cam_mode, double& out_x, double& out_y) {
     g_mouse.cam_x = g_mouse.cam_y = 0.0;
   }
   g_mouse.last_ms = now;
+#if defined(_WIN32)
   SetCursorPos(center.x, center.y);
   SetCursorHidden(true, fg);
+#endif
 
   auto shape = [&](double v) {
     double a = std::abs(v);
@@ -980,15 +1049,32 @@ bool MouseSteerPoll(bool cam_mode, double& out_x, double& out_y) {
     if (a > 1.0) a = 1.0;
     return v < 0 ? -a : a;
   };
+  if (!cam_mode && mc.steer_model == "vector") {
+    // Round deadzone first, so a pointer left near the centre flies straight
+    // (it never recentres by itself), then the usual anti-deadzone along the
+    // pointer's direction.
+    const double len = std::hypot(g_mouse.x, g_mouse.y);
+    if (len <= ac6::mouse_aim::kStickDeadzone) {
+      out_x = out_y = 0.0;
+      return true;
+    }
+    double a = (len - ac6::mouse_aim::kStickDeadzone) / (1.0 - ac6::mouse_aim::kStickDeadzone);
+    if (mc.curve_exponent != 1.0) a = std::pow(a, mc.curve_exponent);
+    if (mc.anti_deadzone > 0.0) a = mc.anti_deadzone + a * (1.0 - mc.anti_deadzone);
+    a = std::min(a, 1.0);
+    out_x = g_mouse.x / len * a;
+    out_y = g_mouse.y / len * a;
+    return true;
+  }
+  if (!cam_mode && mc.steer_model == "aim") {
+    // Already a closed-loop stick command: shaping would make it overshoot.
+    out_x = g_mouse.x;
+    out_y = g_mouse.y;
+    return true;
+  }
   out_x = shape(cam_mode ? g_mouse.cam_x : g_mouse.x);
   out_y = shape(cam_mode ? g_mouse.cam_y : g_mouse.y);
   return true;
-#else
-  (void)cam_mode;
-  (void)out_x;
-  (void)out_y;
-  return false;
-#endif
 }
 
 // ---- Per-instance injection state -------------------------------------------
@@ -1035,6 +1121,7 @@ void DumpMaskTables(uint8_t* base, uint32_t singleton, uint32_t fifth) {
 uint32_t GatherMirrorBits(const GateState& gate) {
   uint32_t mirror = 0;
   for (size_t i = 0; i < kNumMenuActions; ++i) {
+    if (kMenuActions[i].mirror_bit < 0) continue;
     for (VirtualKey vk : g_config.menu_keys[i]) {
       if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
         mirror |= 1u << kMenuActions[i].mirror_bit;
@@ -1198,21 +1285,11 @@ PPC_EXTERN_FUNC(__imp__rex_sub_82390CE0);  // guest XamInputGetState(user,0,stat
 // downstream layer then sees keyboard presses exactly as pad presses.
 // (Flight/M2 will gate this by game mode so flight keys never collide.)
 uint32_t GatherXInputBits(const GateState& gate) {
-  static const uint16_t kXBits[kNumMenuActions] = {
-      0x0001,  // up      -> DPAD_UP
-      0x0002,  // down    -> DPAD_DOWN
-      0x0004,  // left    -> DPAD_LEFT
-      0x0008,  // right   -> DPAD_RIGHT
-      0x1000,  // confirm -> A
-      0x2000,  // cancel  -> B
-      0x0010,  // start   -> START
-      0x0020,  // back    -> BACK
-  };
   uint32_t bits = 0;
   for (size_t i = 0; i < kNumMenuActions; ++i) {
     for (VirtualKey vk : g_config.menu_keys[i]) {
       if (KeyAllowed(gate, vk) && KeyHeld(vk)) {
-        bits |= kXBits[i];
+        bits |= kMenuActions[i].xinput_buttons;
         break;
       }
     }
@@ -1233,6 +1310,7 @@ PPC_FUNC_IMPL(rex_sub_82390CE0) {
   // the timeout too.
   if (user == 0) {
     CursorIdleHideTick();
+    if (!REXCVAR_GET(ac6_kbm_enabled)) MouseSteerRelease();
   }
 
   // Pad-less operation: when no controller is connected (0x48F), present a
